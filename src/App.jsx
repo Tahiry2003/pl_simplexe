@@ -174,6 +174,17 @@ function buildProblem(objectifStr, contraintesStr) {
 // capture every pedagogical sub-step (entering column, ratio
 // test, pivot, new pivot row) instead of only before/after
 // tableaus.
+//
+// Degenerate-RHS handling (anti-degeneracy epsilon trick):
+// whenever a pivot makes a basic variable's RHS exactly 0, that
+// row is tagged with a symbolic infinitesimal ε (a "shadow"
+// Fraction coefficient, epsCol[i]) that is carried through the
+// exact same row operations (divide by pivot, subtract factor ×
+// pivot row) as the real RHS column. It never influences which
+// column/row is chosen — the real (exact) fractions already give
+// the correct simplex decisions — it is purely there so the
+// tableau can be *displayed* the classic textbook way ("ε",
+// "2ε/3", ...) instead of a plain, ambiguous "0".
 // ============================================================
 
 function solveSimplex({ nVars, isMax, objCoeffs, constraints }) {
@@ -261,6 +272,17 @@ function solveSimplex({ nVars, isMax, objCoeffs, constraints }) {
     return objRow;
   }
 
+  // ---- epsilon shadow column for the RHS (A0), see header comment ----
+  let epsCol = new Array(m).fill(FZERO);
+  for (let i = 0; i < m; i++) {
+    if (tableau[i][totalVars].isZero()) epsCol[i] = FONE;
+  }
+
+  // ---- columns to hide once their artificial variable has left the
+  // basis, matching the textbook convention of dropping A_j (and its
+  // -M cost) from the tableau as soon as it's no longer needed. ----
+  let droppedCols = new Set();
+
   const iterations = [];
   const decisions = [];
   let unbounded = false;
@@ -273,10 +295,13 @@ function solveSimplex({ nVars, isMax, objCoeffs, constraints }) {
       tableau: tableau.map((r) => r.slice()),
       basis: basis.slice(),
       objRow: objRow.slice(),
+      epsCol: epsCol.slice(),
+      hiddenCols: new Set(droppedCols),
     });
 
     let enterCol = -1, maxVal = LMZERO;
     for (let j = 0; j < totalVars; j++) {
+      if (droppedCols.has(j)) continue;
       if (objRow[j].gt(maxVal)) { maxVal = objRow[j]; enterCol = j; }
     }
 
@@ -286,35 +311,65 @@ function solveSimplex({ nVars, isMax, objCoeffs, constraints }) {
     }
 
     const ratios = new Array(m).fill(null);
+    const epsRatios = new Array(m).fill(null);
     let leaveRow = -1, minRatio = null;
     for (let i = 0; i < m; i++) {
       if (tableau[i][enterCol].isPositive()) {
         const ratio = tableau[i][totalVars].div(tableau[i][enterCol]);
         ratios[i] = ratio;
+        epsRatios[i] = epsCol[i].div(tableau[i][enterCol]);
         if (minRatio === null || ratio.lt(minRatio)) { minRatio = ratio; leaveRow = i; }
       }
     }
 
     if (leaveRow === -1) {
-      decisions.push({ enterCol, ratios, leaveRow: -1, unbounded: true });
+      decisions.push({ enterCol, ratios, epsRatios, leaveRow: -1, unbounded: true });
       unbounded = true;
       break;
     }
 
+    const leavingVar = basis[leaveRow];
     const pivotVal = tableau[leaveRow][enterCol];
     const newPivotRow = tableau[leaveRow].map((x) => x.div(pivotVal));
-    decisions.push({ enterCol, ratios, leaveRow, pivotVal, newPivotRow });
+    const newEpsPivot = epsCol[leaveRow].div(pivotVal);
+    decisions.push({ enterCol, ratios, epsRatios, leaveRow, pivotVal, newPivotRow, newEpsPivot });
+
+    // capture the entering-column factors for every row BEFORE any
+    // mutation, so both the real tableau and the epsilon shadow
+    // column are updated with exactly the same coefficients.
+    const factors = new Array(m).fill(FZERO);
+    for (let i = 0; i < m; i++) factors[i] = tableau[i][enterCol];
 
     for (let j = 0; j <= totalVars; j++) tableau[leaveRow][j] = tableau[leaveRow][j].div(pivotVal);
     for (let i = 0; i < m; i++) {
       if (i === leaveRow) continue;
-      const factor = tableau[i][enterCol];
+      const factor = factors[i];
       if (!factor.isZero()) {
         for (let j = 0; j <= totalVars; j++)
           tableau[i][j] = tableau[i][j].sub(factor.mul(tableau[leaveRow][j]));
       }
     }
     basis[leaveRow] = enterCol;
+
+    // once an artificial variable has left the basis, drop its column
+    // from the tableau for every subsequent iteration (textbook style).
+    if (colTypes[leavingVar] === "artificial") droppedCols.add(leavingVar);
+
+    // propagate the epsilon shadow column with the same factors
+    const newEpsCol = epsCol.slice();
+    newEpsCol[leaveRow] = newEpsPivot;
+    for (let i = 0; i < m; i++) {
+      if (i === leaveRow) continue;
+      const factor = factors[i];
+      if (!factor.isZero()) newEpsCol[i] = epsCol[i].sub(factor.mul(newEpsPivot));
+    }
+    // seed a fresh ε for any newly-created zero RHS that isn't
+    // already carrying an epsilon tag from a previous iteration.
+    for (let i = 0; i < m; i++) {
+      if (tableau[i][totalVars].isZero() && newEpsCol[i].isZero()) newEpsCol[i] = FONE;
+    }
+    epsCol = newEpsCol;
+
     iterCount++;
   }
 
@@ -346,6 +401,28 @@ function solveSimplex({ nVars, isMax, objCoeffs, constraints }) {
 function fmt(f) {
   if (f instanceof Fraction) return f.toString();
   return String(f);
+}
+
+// Formats an RHS-style value together with its epsilon shadow: shows
+// the exact real value when it's non-zero, otherwise falls back to
+// "ε" / "kε" when the row carries an epsilon tag (degenerate basic
+// variable), otherwise plain "0".
+function fmtRHS(val, eps) {
+  if (val && !val.isZero()) return fmt(val);
+  if (eps && !eps.isZero()) {
+    // Render as "kε" or "kε/d" (ε sits right after the numerator,
+    // like the textbook's "2ε/3"), not "k/dε".
+    const num = eps.num < 0n ? -eps.num : eps.num;
+    const sign = eps.num < 0n ? "-" : "";
+    const numPart = num === 1n ? "" : num.toString();
+    const denPart = eps.den === 1n ? "" : `/${eps.den.toString()}`;
+    return `${sign}${numPart}ε${denPart}`;
+  }
+  return fmt(val);
+}
+
+function isEpsDisplay(val, eps) {
+  return (!val || val.isZero()) && !!eps && !eps.isZero();
 }
 
 // Formats a symbolic "c + m·M" value the way the textbook does:
@@ -408,19 +485,23 @@ function opSymbol(op) {
 // ============================================================
 // Tableau (classic French textbook layout) with optional
 // pedagogical overlays: entering-column mark, ratio column,
-// pivot mark, and "new pivot row" preview.
+// pivot mark, new pivot row preview, and degenerate ε display.
 // ============================================================
 
-function Tableau({ costs, colTypes, tableau, basis, objRow, totalVars, highlight }) {
+function Tableau({ costs, colTypes, tableau, basis, objRow, totalVars, highlight, epsCol, hiddenCols }) {
   const zValue = objRow[objRow.length - 1];
   const phase = highlight?.phase;
   const enterCol = highlight?.enterCol ?? -1;
   const leaveRow = highlight?.leaveRow ?? -1;
   const ratios = highlight?.ratios;
+  const epsRatios = highlight?.epsRatios;
   const showRatio = phase === "ratio" || phase === "pivot" || phase === "newrow";
   const showPivotMark = phase === "pivot" || phase === "newrow";
   const showNewRow = phase === "newrow";
   const newPivotRow = highlight?.newPivotRow;
+  const newEpsPivot = highlight?.newEpsPivot;
+  const hidden = hiddenCols || new Set();
+  const visibleCols = Array.from({ length: totalVars }, (_, j) => j).filter((j) => !hidden.has(j));
 
   return (
     <table className="border-collapse mx-auto text-sm text-center">
@@ -428,7 +509,7 @@ function Tableau({ costs, colTypes, tableau, basis, objRow, totalVars, highlight
         <tr>
           <th className="border border-slate-400 px-3 py-1.5 bg-slate-50">Ci</th>
           <th className="border border-slate-400 px-3 py-1.5 bg-slate-50">i</th>
-          {Array.from({ length: totalVars }, (_, j) => (
+          {visibleCols.map((j) => (
             <th
               key={j}
               className={`border border-slate-400 px-3 py-1.5 font-serif italic ${
@@ -451,13 +532,18 @@ function Tableau({ costs, colTypes, tableau, basis, objRow, totalVars, highlight
       <tbody>
         {tableau.map((row, i) => {
           const isPivotRow = showPivotMark && i === leaveRow;
+          const rhsVal =
+            showNewRow && i === leaveRow && newPivotRow ? newPivotRow[totalVars] : row[row.length - 1];
+          const rhsEps = showNewRow && i === leaveRow ? newEpsPivot : epsCol && epsCol[i];
+          const rhsIsEps = isEpsDisplay(rhsVal, rhsEps);
           return (
             <tr key={i}>
               <td className="border border-slate-400 px-3 py-1.5">
                 {fmtCost(costs[basis[i]], colTypes[basis[i]])}
               </td>
               <td className="border border-slate-400 px-3 py-1.5">{basis[i] + 1}</td>
-              {row.slice(0, -1).map((val, j) => {
+              {visibleCols.map((j) => {
+                const val = row[j];
                 const isPivotCell = showPivotMark && i === leaveRow && j === enterCol;
                 const displayVal =
                   showNewRow && i === leaveRow && newPivotRow ? newPivotRow[j] : val;
@@ -483,9 +569,9 @@ function Tableau({ costs, colTypes, tableau, basis, objRow, totalVars, highlight
               <td
                 className={`border border-slate-400 px-3 py-1.5 font-mono font-semibold ${
                   showNewRow && i === leaveRow ? "bg-green-50 text-green-800" : ""
-                }`}
+                } ${rhsIsEps ? "text-red-600" : ""}`}
               >
-                {fmt(showNewRow && i === leaveRow && newPivotRow ? newPivotRow[totalVars] : row[row.length - 1])}
+                {fmtRHS(rhsVal, rhsEps)}
               </td>
               {showRatio && (
                 <td
@@ -493,7 +579,9 @@ function Tableau({ costs, colTypes, tableau, basis, objRow, totalVars, highlight
                     i === leaveRow ? "bg-red-100 text-red-700 font-bold" : ""
                   }`}
                 >
-                  {ratios && ratios[i] ? fmt(ratios[i]) : "\u221e"}
+                  {ratios && ratios[i]
+                    ? fmtRHS(ratios[i], epsRatios ? epsRatios[i] : null)
+                    : "\u221e"}
                 </td>
               )}
             </tr>
@@ -504,14 +592,14 @@ function Tableau({ costs, colTypes, tableau, basis, objRow, totalVars, highlight
           <td colSpan={2} className="border border-slate-400 px-3 py-1.5 font-semibold text-right">
             Cj
           </td>
-          {costs.map((c, j) => (
+          {visibleCols.map((j) => (
             <td
               key={j}
               className={`border border-slate-400 px-3 py-1.5 font-mono ${
                 j === enterCol ? "bg-blue-50" : ""
               }`}
             >
-              {fmtCost(c, colTypes[j])}
+              {fmtCost(costs[j], colTypes[j])}
             </td>
           ))}
           <td className="border border-slate-400 px-3 py-1.5"></td>
@@ -522,14 +610,14 @@ function Tableau({ costs, colTypes, tableau, basis, objRow, totalVars, highlight
           <td colSpan={2} className="border border-slate-400 px-3 py-1.5 font-semibold text-right">
             Δj
           </td>
-          {objRow.slice(0, -1).map((val, j) => (
+          {visibleCols.map((j) => (
             <td
               key={j}
               className={`border border-slate-400 px-3 py-1.5 font-mono ${
                 j === enterCol ? "bg-red-100 text-red-700 font-bold" : ""
               }`}
             >
-              {fmtLM(val)}
+              {fmtLM(objRow[j])}
             </td>
           ))}
           <td className="border-2 border-slate-700 px-3 py-1.5 font-mono font-semibold">
@@ -614,6 +702,7 @@ function MatrixView({ problem, result }) {
   const init = iterations[0];
   const basis = init.basis;
   const tableau = init.tableau;
+  const epsCol = init.epsCol;
 
   let z0 = LMZERO;
   for (let i = 0; i < m; i++) z0 = z0.add(costs[basis[i]].mulF(tableau[i][totalVars]));
@@ -659,13 +748,21 @@ function MatrixView({ problem, result }) {
           <span className="text-3xl font-serif">[</span>
           <table className="border-collapse">
             <tbody>
-              {tableau.map((row, i) => (
-                <tr key={i}>
-                  <td className="px-3 py-1 font-mono text-center font-semibold">
-                    {fmt(row[totalVars])}
-                  </td>
-                </tr>
-              ))}
+              {tableau.map((row, i) => {
+                const eps = epsCol && epsCol[i];
+                const rhsIsEps = isEpsDisplay(row[totalVars], eps);
+                return (
+                  <tr key={i}>
+                    <td
+                      className={`px-3 py-1 font-mono text-center font-semibold ${
+                        rhsIsEps ? "text-red-600" : ""
+                      }`}
+                    >
+                      {fmtRHS(row[totalVars], eps)}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
           <span className="text-3xl font-serif">]</span>
@@ -691,7 +788,7 @@ function MatrixView({ problem, result }) {
         <div className="mt-2">
           {tableau.map((row, i) => (
             <div key={i} className="font-mono">
-              x<sub>{basis[i] + 1}</sub> = {fmt(row[totalVars])}
+              x<sub>{basis[i] + 1}</sub> = {fmtRHS(row[totalVars], epsCol && epsCol[i])}
             </div>
           ))}
         </div>
@@ -826,6 +923,8 @@ export default function App() {
             basis={snap.basis}
             objRow={snap.objRow}
             highlight={highlight}
+            epsCol={snap.epsCol}
+            hiddenCols={snap.hiddenCols}
           />
           {frame.phase === "pivot" && decision && (
             <div className="mt-4 bg-blue-50 border border-blue-100 rounded-lg p-4 text-sm font-mono">
